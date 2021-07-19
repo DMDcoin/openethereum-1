@@ -77,7 +77,10 @@ mod test_signer {
             match self.0.sign(self.1, Some(self.2.clone()), hash) {
                 Err(SignError::NotUnlocked) => unreachable!(),
                 Err(SignError::NotFound) => Err(crypto::publickey::Error::InvalidAddress),
-                Err(SignError::SStore(accounts::Error::EthCryptoPublicKey(err))) => Err(err),
+                Err(SignError::SStore(accounts::Error::EthCryptoPublicKey(err))) => {
+					warn!("unable to sign hash {} with address {}", hash, self.1);
+					Err(err)
+				},
                 Err(SignError::SStore(accounts::Error::EthCrypto(err))) => {
                     warn!("Low level crypto error: {:?}", err);
                     Err(crypto::publickey::Error::InvalidSecretKey)

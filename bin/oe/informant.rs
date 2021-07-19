@@ -354,7 +354,9 @@ impl ChainNotify for Informant<FullNodeInformantData> {
         if new_blocks.has_more_blocks_to_import {
             return;
         }
+        info!(target: "import", "Informant: trying to get lock.");
         let mut last_import = self.last_import.lock();
+        info!(target: "import", "Informant: got lock.");
         let client = &self.target.client;
 
         let importing = self.target.is_major_importing();

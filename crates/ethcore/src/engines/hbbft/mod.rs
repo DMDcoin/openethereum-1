@@ -3,6 +3,7 @@ mod contracts;
 mod contribution;
 mod hbbft_engine;
 mod hbbft_state;
+mod keygen_transactions;
 mod sealing;
 #[cfg(test)]
 mod test;

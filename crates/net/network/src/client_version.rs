@@ -18,7 +18,7 @@
 
 //! Parse ethereum client ID strings and provide querying functionality
 
-use semver::Version;
+use semver::{Identifier, Version};
 use std::fmt;
 
 /// Parity client string prefix
@@ -72,7 +72,7 @@ impl ParityClientData {
         }
     }
 
-    fn name(&self) -> &str {
+    pub fn name(&self) -> &str {
         self.name.as_str()
     }
 
@@ -131,6 +131,9 @@ pub trait ClientCapabilities {
     /// Service transactions are specific to parity and nethermind. Query if
     /// this version accepts them.
     fn accepts_service_transaction(&self) -> bool;
+
+    /// is a HBBFT capable client.
+    fn is_hbbft(&self) -> bool;
 }
 
 impl ClientCapabilities for ClientVersion {
@@ -148,6 +151,27 @@ impl ClientCapabilities for ClientVersion {
             ClientVersion::ParityUnknownFormat(_) => true,
             ClientVersion::Other(client_id) => is_nethermind(client_id),
         }
+    }
+
+    fn is_hbbft(&self) -> bool {
+        match self {
+            ClientVersion::ParityClient(client) => {
+                for id in client.semver.pre.iter() {
+                    match id {
+                        Identifier::AlphaNumeric(alpha) => {
+                            if alpha.contains("hbbft") {
+                                return true;
+                            }
+                        }
+                        Identifier::Numeric(_) => {}
+                    }
+                }
+                return false;
+            }
+            ClientVersion::ParityUnknownFormat(_) => false,
+            ClientVersion::Other(_) => false,
+        };
+        return false;
     }
 }
 

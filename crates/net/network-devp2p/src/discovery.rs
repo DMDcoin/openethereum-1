@@ -217,6 +217,7 @@ impl<'a> Discovery<'a> {
     pub fn add_node(&mut self, e: NodeEntry) {
         // If distance returns None, then we are trying to add ourself.
         let id_hash = keccak(e.id);
+        trace!(target: "discovery", "adding node {} hash: {}", e.id, id_hash);
         if let Some(dist) = Discovery::distance(&self.id_hash, &id_hash) {
             if self.node_buckets[dist]
                 .nodes
@@ -316,6 +317,7 @@ impl<'a> Discovery<'a> {
     }
 
     fn update_new_nodes(&mut self) {
+        trace!(target: "discovery", "update_new_nodes");
         while self.in_flight_pings.len() < MAX_NODES_PING {
             match self.adding_nodes.pop() {
                 Some(next) => self.try_ping(next, PingReason::Default),
@@ -530,6 +532,7 @@ impl<'a> Discovery<'a> {
         let node_id = recover(&signature.into(), &keccak(signed))?;
         let packet_id = signed[0];
         let rlp = Rlp::new(&signed[1..]);
+        trace!(target: "discovery", "got packet_id: {} node_id {}", packet_id, node_id);
         match packet_id {
             PACKET_PING => self.on_ping(&rlp, &node_id, &from, hash_signed.as_bytes()),
             PACKET_PONG => self.on_pong(&rlp, &node_id, &from),

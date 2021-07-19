@@ -3,13 +3,13 @@ use std::{
     collections::BTreeMap,
     convert::TryFrom,
     ops::BitXor,
-    sync::{Arc, Weak},
+    sync::{atomic::AtomicBool, Arc, Weak},
     time::Duration,
 };
 
 use super::block_reward_hbbft::BlockRewardContract;
 use block::ExecutedBlock;
-use client::traits::{EngineClient, ForceUpdateSealing};
+use client::traits::{EngineClient, ForceUpdateSealing, TransactionRequest};
 use crypto::publickey::Signature;
 use engines::{
     default_system_or_code_call, signer::EngineSigner, Engine, EngineError, ForkChoice, Seal,
@@ -35,15 +35,20 @@ use types::{
 
 use super::{
     contracts::{
-        keygen_history::{initialize_synckeygen, send_keygen_transactions},
+        keygen_history::initialize_synckeygen,
         staking::start_time_of_next_phase_transition,
         validator_set::{get_pending_validators, is_pending_validator, ValidatorType},
     },
     contribution::{unix_now_millis, unix_now_secs},
     hbbft_state::{Batch, HbMessage, HbbftState, HoneyBadgerStep},
+    keygen_transactions::KeygenTransactionSender,
     sealing::{self, RlpSig, Sealing},
     NodeId,
 };
+use engines::hbbft::contracts::validator_set::{
+    get_validator_available_since, send_tx_announce_availability, staking_by_mining_address,
+};
+use std::{ops::Deref, sync::atomic::Ordering};
 
 type TargetedMessage = hbbft::TargetedMessage<Message, NodeId>;
 
@@ -67,6 +72,7 @@ pub struct HoneyBadgerBFT {
     params: HbbftParams,
     message_counter: RwLock<usize>,
     random_numbers: RwLock<BTreeMap<BlockNumber, U256>>,
+    keygen_transaction_sender: RwLock<KeygenTransactionSender>,
 }
 
 struct TransitionHandler {
@@ -77,21 +83,20 @@ struct TransitionHandler {
 const DEFAULT_DURATION: Duration = Duration::from_secs(1);
 
 impl TransitionHandler {
-    /// Returns the approximate time duration between the latest block and the minimum block time
-    /// or a keep-alive time duration of 1s.
-    fn duration_remaining_since_last_block(&self, client: Arc<dyn EngineClient>) -> Duration {
+    /// Returns the approximate time duration between the latest block and the given offset
+    /// (is 0 if the offset was passed) or the default time duration of 1s.
+    fn block_time_until(&self, client: Arc<dyn EngineClient>, offset: u64) -> Duration {
         if let Some(block_header) = client.block_header(BlockId::Latest) {
             // The block timestamp and minimum block time are specified in seconds.
-            let next_block_time =
-                (block_header.timestamp() + self.engine.params.minimum_block_time) as u128 * 1000;
+            let next_block_time = (block_header.timestamp() + offset) as u128 * 1000;
 
             // We get the current time in milliseconds to calculate the exact timer duration.
             let now = unix_now_millis();
 
             if now >= next_block_time {
-                // If the current time is already past the minimum time for the next block,
-                // just return the 1s keep alive interval.
-                DEFAULT_DURATION
+                // If the current time is already past the minimum time for the next block
+                // return 0 to signal readiness to create the next block.
+                Duration::from_secs(0)
             } else {
                 // Otherwise wait the exact number of milliseconds needed for the
                 // now >= next_block_time condition to be true.
@@ -109,6 +114,16 @@ impl TransitionHandler {
             error!(target: "consensus", "Latest Block Header could not be obtained!");
             DEFAULT_DURATION
         }
+    }
+
+    // Returns the time remaining until minimum block time is passed or the default time duration of 1s.
+    fn min_block_time_remaining(&self, client: Arc<dyn EngineClient>) -> Duration {
+        self.block_time_until(client, self.engine.params.minimum_block_time)
+    }
+
+    // Returns the time remaining until maximum block time is passed or the default time duration of 1s.
+    fn max_block_time_remaining(&self, client: Arc<dyn EngineClient>) -> Duration {
+        self.block_time_until(client, self.engine.params.maximum_block_time)
     }
 }
 
@@ -135,27 +150,37 @@ impl IoHandler<()> for TransitionHandler {
                 }
             }
 
-            // Send Keygen transactions if necessary.
-            // Do this *before* calling on_transactions_imported to avoid starting
-            // a new block without giving it a chance to include Keygen transactions.
-            //self.engine.do_keygen();
-
-            // @todo Trigger block creation when we are not in the keygen phase yet,
-            //       but should be according to the epoch length settings.
-            self.engine.start_hbbft_epoch_if_next_phase();
-
-            // Transactions may have been submitted during creation of the last block, trigger the
-            // creation of a new block if the transaction threshold has been reached.
-            self.engine.on_transactions_imported();
-
             // Periodically allow messages received for future epochs to be processed.
             self.engine.replay_cached_messages();
+
+            if let Err(e) = self.engine.do_availability_handling() {
+                error!(target: "engine", "Error during do_availability_handling: {}", e)
+            }
 
             // The client may not be registered yet on startup, we set the default duration.
             let mut timer_duration = DEFAULT_DURATION;
             if let Some(ref weak) = *self.client.read() {
                 if let Some(c) = weak.upgrade() {
-                    timer_duration = self.duration_remaining_since_last_block(c);
+                    timer_duration = self.min_block_time_remaining(c.clone());
+
+                    // If the minimum block time has passed we are ready to trigger new blocks.
+                    if timer_duration == Duration::from_secs(0) {
+                        // Always create blocks if we are in the keygen phase.
+                        self.engine.start_hbbft_epoch_if_next_phase();
+
+                        // Transactions may have been submitted during creation of the last block, trigger the
+                        // creation of a new block if the transaction threshold has been reached.
+                        self.engine.on_transactions_imported();
+
+                        // If the maximum block time has been reached we trigger a new block in any case.
+                        if self.max_block_time_remaining(c.clone()) == Duration::from_secs(0) {
+                            self.engine.start_hbbft_epoch(c);
+                        }
+
+                        // Set timer duration to the default period (1s)
+                        timer_duration = DEFAULT_DURATION;
+                    }
+
                     // The duration should be at least 1ms and at most self.engine.params.minimum_block_time
                     timer_duration = max(timer_duration, Duration::from_millis(1));
                     timer_duration = min(
@@ -186,6 +211,7 @@ impl HoneyBadgerBFT {
             params,
             message_counter: RwLock::new(0),
             random_numbers: RwLock::new(BTreeMap::new()),
+            keygen_transaction_sender: RwLock::new(KeygenTransactionSender::new()),
         });
 
         if !engine.params.is_unit_test.unwrap_or(false) {
@@ -430,6 +456,7 @@ impl HoneyBadgerBFT {
     fn join_hbbft_epoch(&self) -> Result<(), EngineError> {
         let client = self.client_arc().ok_or(EngineError::RequiresClient)?;
         if self.is_syncing(&client) {
+            trace!(target: "consensus", "tried to join HBBFT Epoch, but still syncing.");
             return Ok(());
         }
         let step = self
@@ -525,6 +552,87 @@ impl HoneyBadgerBFT {
         Some(())
     }
 
+    fn do_availability_handling(&self) -> Result<(), String> {
+        // only try once on startup-
+        static HAS_SENT: AtomicBool = AtomicBool::new(false);
+
+        if !HAS_SENT.load(Ordering::SeqCst) {
+            // If we have no signer there is nothing for us to send.
+            let address = match self.signer.read().as_ref() {
+                Some(signer) => signer.address(),
+                None => {
+                    // warn!("Could not retrieve address for writing availability transaction.");
+                    return Ok(());
+                }
+            };
+
+            match self.client_arc() {
+                Some(client) => {
+                    if !self.is_syncing(&client) {
+                        let engine_client = client.deref();
+
+                        match staking_by_mining_address(engine_client, &address) {
+                            Ok(staking_address) => {
+                                if staking_address.is_zero() {
+                                    //TODO: here some fine handling can improve performance.
+                                    //with this implementation every node (validator or not)
+                                    //needs to query this state every block.
+                                    //trace!(target: "engine", "availability handling not a validator");
+                                    return Ok(());
+                                }
+                            }
+                            Err(call_error) => {
+                                error!(target: "engine", "unable to ask for corresponding staking address for given mining address: {:?}", call_error);
+                                let message = format!("unable to ask for corresponding staking address for given mining address: {:?}", call_error);
+                                return Err(message.into());
+                            }
+                        }
+
+                        match get_validator_available_since(engine_client, &address) {
+                            Ok(s) => {
+                                if s.is_zero() {
+                                    //let c : &dyn BlockChainClient = client.into();
+                                    match client.as_full_client() {
+                                        Some(c) => {
+                                            //debug!(target: "engine", "sending announce availability transaction");
+                                            info!("sending announce availability transaction");
+                                            match send_tx_announce_availability(c, &address) {
+                                                Ok(()) => {}
+                                                Err(call_error) => {
+                                                    //error!(target: "engine", "CallError during announce availability. {:?}", call_error);
+                                                    return Err(format!("CallError during announce availability. {:?}", call_error));
+                                                }
+                                            }
+                                        }
+                                        None => {
+                                            return Err(
+                                                "Unable to retrieve client.as_full_client()".into(),
+                                            );
+                                        }
+                                    }
+
+                                    HAS_SENT.store(true, Ordering::SeqCst);
+                                }
+                            }
+                            Err(e) => {
+                                //return Err(format!("Error trying to send availability check: {:?}", e));
+                                return Err(format!(
+                                    "Error trying to send availability check: {:?}",
+                                    e
+                                ));
+                            }
+                        }
+                    }
+                }
+                None => {
+                    return Err("could not send availability announcement because client_arc could not be retrieved:".into());
+                }
+            }
+        }
+
+        return Ok(());
+    }
+
     /// Returns true if we are in the keygen phase and a new key has been generated.
     fn do_keygen(&self) -> bool {
         match self.client_arc() {
@@ -559,8 +667,18 @@ impl HoneyBadgerBFT {
                 //       and call it periodically using timer events instead of on close block.
                 if let Some(signer) = self.signer.read().as_ref() {
                     if let Ok(is_pending) = is_pending_validator(&*client, &signer.address()) {
+                        trace!(target: "engine", "is_pending_validator: {}", is_pending);
                         if is_pending {
-                            let _err = send_keygen_transactions(&*client, &self.signer);
+                            let _err = self
+                                .keygen_transaction_sender
+                                .write()
+                                .send_keygen_transactions(&*client, &self.signer);
+                            match _err {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    error!(target: "engine", "Error sending keygen transactions {:?}", e);
+                                }
+                            }
                         }
                     }
                 }
@@ -795,9 +913,12 @@ impl Engine<EthereumMachine> for HoneyBadgerBFT {
     fn on_close_block(&self, block: &mut ExecutedBlock) -> Result<(), Error> {
         self.check_for_epoch_change();
         if let Some(address) = self.params.block_reward_contract_address {
+            let header_number = block.header.number();
             let mut call = default_system_or_code_call(&self.machine, block);
+            let is_epoch_end = self.do_keygen();
+            trace!(target: "consensus", "calling reward function for block {} isEpochEnd? {} on address: {}", header_number,  is_epoch_end, address);
             let contract = BlockRewardContract::new_from_address(address);
-            let _total_reward = contract.reward(&mut call, self.do_keygen())?;
+            let _total_reward = contract.reward(&mut call, is_epoch_end)?;
         }
         Ok(())
     }

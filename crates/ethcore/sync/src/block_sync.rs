@@ -14,6 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with OpenEthereum.  If not, see <http://www.gnu.org/licenses/>.
 
+// use std::backtrace::Backtrace;
 use blocks::{BlockCollection, SyncBody, SyncHeader};
 use chain::BlockSet;
 use ethcore::{
@@ -485,6 +486,21 @@ impl BlockDownloader {
 
     fn start_sync_round(&mut self, io: &mut dyn SyncIo) {
         self.state = State::ChainHead;
+
+        let config_is_instant_finality = true;
+
+        // on a chain with instant finality,
+        // we dont need to do any retractions.
+        if config_is_instant_finality {
+            // self.state = State::Complete;
+
+            self.last_round_start = self.last_imported_block;
+            self.last_round_start_hash = self.last_imported_hash;
+            self.imported_this_round = None;
+
+            return;
+        }
+
         trace_sync!(
             self,
             "Starting round (last imported count = {:?}, last started = {}, block = {:?}",
@@ -537,18 +553,24 @@ impl BlockDownloader {
                             start,
                             start_hash
                         );
+                        // let bt = Backtrace::new();
+                        // println!("{:?}", bt);
                         self.reset_to_block(&best_hash, best);
                     } else {
                         let n = start - cmp::min(self.retract_step, start);
                         if n == 0 {
                             info!("Header not found, bottom line reached, resetting, last imported: {}", self.last_imported_hash);
+                            info!(target: "sync", "Header not found: start: {} best: {} retract_step: {}, last_imported_hash: {}, oldest_reorg: {}", start, best, self.retract_step, self.last_imported_hash, oldest_reorg);
                             self.reset_to_block(&best_hash, best);
                         } else {
                             self.retract_step *= 2;
                             match io.chain().block_hash(BlockId::Number(n)) {
                                 Some(h) => {
+                                    info!(target: "sync", "Header not found? : retract_step {} n: {} h: {} last_imported_block: {} last_imported_hash: {} oldest_reorg {}", self.retract_step, n, h, self.last_imported_block, self.last_imported_hash, oldest_reorg);
+
                                     self.last_imported_block = n;
                                     self.last_imported_hash = h;
+
                                     trace_sync!(
                                         self,
                                         "Searching common header in the blockchain {} ({})",
@@ -617,6 +639,9 @@ impl BlockDownloader {
                 let needed_bodies = self
                     .blocks
                     .needed_bodies(number_of_bodies_to_request, false);
+
+                info!(target: "sync", "Downloading blocks from Peer {} sync with better chain. needed Bodies: {}, download receipts: {}", peer_id, needed_bodies.len(),self.download_receipts);
+
                 if !needed_bodies.is_empty() {
                     return Some(BlockRequest::Bodies {
                         hashes: needed_bodies,

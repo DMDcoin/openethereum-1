@@ -551,6 +551,7 @@ impl Host {
             if info.config.discovery_enabled
                 && info.config.non_reserved_mode == NonReservedPeerMode::Accept
             {
+                info!(target: "network", "Starting discovery on Endpoint: {}, ip_filter: {}", public_endpoint, allow_ips);
                 Some(Discovery::new(&info.keys, public_endpoint, allow_ips))
             } else {
                 None

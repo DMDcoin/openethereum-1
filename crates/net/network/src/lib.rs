@@ -57,6 +57,7 @@ use rlp::{Decodable, DecoderError, Rlp};
 use std::{
     cmp::Ordering,
     collections::HashMap,
+    fmt::{self, Display},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     str::{self, FromStr},
     sync::Arc,
@@ -456,6 +457,12 @@ impl IpFilter {
             }
         }
         Ok(filter)
+    }
+}
+
+impl Display for IpFilter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "IPFilter: {:?})", self.predefined)
     }
 }
 

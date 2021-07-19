@@ -156,6 +156,12 @@ impl FromStr for NodeEndpoint {
     }
 }
 
+impl Display for NodeEndpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} (port: {})", self.address, self.udp_port)
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub enum PeerType {
     _Required,

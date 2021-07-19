@@ -26,6 +26,8 @@ use serde::Deserialize;
 pub struct HbbftParams {
     /// The minimum time duration between blocks, in seconds.
     pub minimum_block_time: u64,
+    /// The maximum time duration between blocks, in seconds.
+    pub maximum_block_time: u64,
     /// The length of the transaction queue at which block creation should be triggered.
     pub transaction_queue_size_trigger: usize,
     /// Should be true when running unit tests to avoid starting timers.
@@ -45,25 +47,29 @@ pub struct Hbbft {
 #[cfg(test)]
 mod tests {
     use super::Hbbft;
+    use ethereum_types::Address;
+    use std::str::FromStr;
 
     #[test]
     fn hbbft_deserialization() {
         let s = r#"{
 			"params": {
 				"minimumBlockTime": 0,
+				"maximumBlockTime": 600,
 				"transactionQueueSizeTrigger": 1,
 				"isUnitTest": true,
-				"blockRewardContractAddress": "0x2000000000000000000000000000000000000002",
+				"blockRewardContractAddress": "0x2000000000000000000000000000000000000002"
 			}
 		}"#;
 
         let deserialized: Hbbft = serde_json::from_str(s).unwrap();
         assert_eq!(deserialized.params.minimum_block_time, 0);
+        assert_eq!(deserialized.params.maximum_block_time, 600);
         assert_eq!(deserialized.params.transaction_queue_size_trigger, 1);
         assert_eq!(deserialized.params.is_unit_test, Some(true));
         assert_eq!(
             deserialized.params.block_reward_contract_address,
-            Address::from("0x2000000000000000000000000000000000000002")
+            Address::from_str("2000000000000000000000000000000000000002").ok()
         );
     }
 }
